@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <title>YOLO + ONNX Runtime Demo (Camera)</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.min.js"></script>
+  <style>
+    body {
+      margin: 0;
+      background: #111;
+      color: #eee;
+      font-family: sans-serif;
+      text-align: center;
+    }
+    video, canvas {
+      width: 100%;
+      height: auto;
+      max-width: 640px;
+      border-radius: 12px;
+      margin-top: 12px;
+    }
+    #labelBox {
+      position: fixed;
+      bottom: 10px;
+      left: 10px;
+      background: rgba(0, 255, 100, 0.8);
+      padding: 6px 10px;
+      border-radius: 8px;
+      font-size: 18px;
+      font-weight: bold;
+      color: #000;
+      min-width: 100px;
+    }
+  </style>
+</head>
+<body>
+  <h2>YOLO + ONNX Runtime Web Demo</h2>
+  <video id="camera" autoplay muted playsinline></video>
+  <canvas id="canvas"></canvas>
+  <div id="labelBox">読み込み中...</div>
+
+  <script>
+    let session;
+    let labels = ["object"];
+    const video = document.getElementById('camera');
+    const canvas = document.getElementById('canvas');
+    const ctx = canvas.getContext('2d');
+    const labelBox = document.getElementById('labelBox');
+    const INPUT_SIZE = 640;
+
+    // カメラ初期化
+    async function initCamera() {
+      const stream = await navigator.mediaDevices.getUserMedia({ video: true });
+      video.srcObject = stream;
+      return new Promise(resolve => {
+        video.onloadedmetadata = () => resolve();
+      });
+    }
+
+    // モデル＆ラベル読み込み
+    async function initModel() {
+      session = await ort.InferenceSession.create('./model.onnx', { executionProviders: ['webgpu'] });
+      const res = await fetch('./labels.json');
+      labels = await res.json();
+      labelBox.textContent = '準備完了';
+    }
+
+    // 推論処理
+    async function detect() {
+      if (!session) return;
+
+      // 入力サイズにリサイズ
+      const w = video.videoWidth;
+      const h = video.videoHeight;
+      canvas.width = w;
+      canvas.height = h;
+
+      const off = document.createElement('canvas');
+      off.width = INPUT_SIZE;
+      off.height = INPUT_SIZE;
+      const octx = off.getContext('2d');
+      octx.drawImage(video, 0, 0, INPUT_SIZE, INPUT_SIZE);
+      const imageData = octx.getImageData(0, 0, INPUT_SIZE, INPUT_SIZE).data;
+
+      // RGB整形
+      const [r, g, b] = [[], [], []];
+      for (let i = 0; i < imageData.length; i += 4) {
+        r.push(imageData[i] / 255.0);
+        g.push(imageData[i + 1] / 255.0);
+        b.push(imageData[i + 2] / 255.0);
+      }
+      const tensor = new ort.Tensor('float32', [...r, ...g, ...b], [1, 3, INPUT_SIZE, INPUT_SIZE]);
+
+      // 推論
+      const result = await session.run({ images: tensor });
+      const data = result.output0.data;
+      const num = result.output0.dims[1];
+      const size = result.output0.dims[2];
+
+      // 描画リセット
+      ctx.drawImage(video, 0, 0, w, h);
+
+      // 検出結果から一番高スコアを表示
+      let bestScore = 0;
+      let bestClass = '';
+      let bestBox = null;
+
+      for (let i = 0; i < num; i++) {
+        const [x1, y1, x2, y2, score, classId] = data.slice(i * size, (i + 1) * size);
+        if (score > bestScore) {
+          bestScore = score;
+          bestClass = labels[Math.floor(classId)] || 'unknown';
+          bestBox = [x1, y1, x2, y2];
+        }
+      }
+
+      if (bestScore > 0.2 && bestBox) {
+        const [x1, y1, x2, y2] = bestBox;
+        const bx = (x1 / INPUT_SIZE) * w;
+        const by = (y1 / INPUT_SIZE) * h;
+        const bw = ((x2 - x1) / INPUT_SIZE) * w;
+        const bh = ((y2 - y1) / INPUT_SIZE) * h;
+        ctx.lineWidth = 4;
+        ctx.strokeStyle = '#00ff88';
+        ctx.strokeRect(bx, by, bw, bh);
+        labelBox.textContent = `${bestClass} ${(bestScore * 100).toFixed(1)}%`;
+      } else {
+        labelBox.textContent = '検出なし';
+      }
+
+      requestAnimationFrame(detect);
+    }
+
+    // メイン処理
+    (async () => {
+      try {
+        await initCamera();
+        await initModel();
+        detect();
+      } catch (err) {
+        console.error(err);
+        labelBox.textContent = 'エラー: ' + err.message;
+      }
+    })();
+  </script>
+</body>
+</html>
