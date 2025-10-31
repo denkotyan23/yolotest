@@ -2,106 +2,135 @@
 <html lang="ja">
 <head>
   <meta charset="UTF-8">
-  <title>YOLOv8 ONNX Web推論</title>
+  <title>YOLOv8n ONNX Web Demo</title>
   <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.min.js"></script>
   <style>
-    body { font-family: sans-serif; text-align: center; background: #f4f4f4; }
-    canvas { border: 1px solid #333; margin-top: 10px; }
-    input { margin: 10px; }
+    body { font-family: sans-serif; text-align: center; background: #f0f0f0; }
+    canvas { border: 2px solid #333; margin-top: 10px; }
+    #log { margin-top: 10px; white-space: pre; background: #fff; display: inline-block; padding: 10px; text-align: left; }
   </style>
 </head>
 <body>
-  <h2>YOLOv8 ONNX 推論デモ</h2>
+  <h1>YOLOv8n ONNX Web推論デモ</h1>
+
   <input type="file" id="fileInput" accept="image/*"><br>
-  <canvas id="canvas"></canvas>
+  <button id="runBtn">推論実行</button>
+  <br>
+  <canvas id="canvas" width="640" height="640"></canvas>
 
-  <script type="module">
-    const modelPath = "./yolov8n.onnx"; // GitHub Pages直下に配置
+  <div id="log"></div>
 
-    const session = await ort.InferenceSession.create(modelPath, {
-      executionProviders: ['wasm'],
-    });
-    console.log("✅ モデル読み込み成功:", modelPath);
-
-    const fileInput = document.getElementById("fileInput");
+  <script>
+    const modelUrl = "./1234.onnx"; // 同じフォルダに置く
+    let session = null;
     const canvas = document.getElementById("canvas");
     const ctx = canvas.getContext("2d");
+    const log = (msg) => { document.getElementById("log").textContent += msg + "\n"; };
 
-    fileInput.onchange = async () => {
-      const file = fileInput.files[0];
-      const img = new Image();
-      img.src = URL.createObjectURL(file);
-      await img.decode();
+    async function init() {
+      log("モデル読み込み中...");
+      try {
+        session = await ort.InferenceSession.create(modelUrl, {
+          executionProviders: ['wasm'],
+        });
+        log("✅ モデル読み込み完了");
+      } catch (e) {
+        log("❌ モデル読み込み失敗: " + e);
+      }
+    }
 
-      const size = 640; // YOLOv8標準サイズ
-      canvas.width = size;
-      canvas.height = size;
+    function preprocess(img) {
+      const tmpCanvas = document.createElement("canvas");
+      tmpCanvas.width = 640;
+      tmpCanvas.height = 640;
+      const tmpCtx = tmpCanvas.getContext("2d");
+      tmpCtx.drawImage(img, 0, 0, 640, 640);
 
-      // ==== レターボックス付き描画 ====
-      const scale = Math.min(size / img.width, size / img.height);
-      const x = (size - img.width * scale) / 2;
-      const y = (size - img.height * scale) / 2;
-      ctx.fillStyle = "black";
-      ctx.fillRect(0, 0, size, size);
-      ctx.drawImage(img, x, y, img.width * scale, img.height * scale);
+      const imageData = tmpCtx.getImageData(0, 0, 640, 640);
+      const data = imageData.data;
+      const float32Data = new Float32Array(3 * 640 * 640);
 
-      // ==== テンソル作成 ====
-      const imageData = ctx.getImageData(0, 0, size, size);
-      const data = Float32Array.from(imageData.data)
-        .filter((_, i) => i % 4 !== 3) // alpha除去
-        .map(v => v / 255.0); // 標準化
-
-      // RGB → BGR
-      const chw = new Float32Array(3 * size * size);
-      let p = 0;
-      for (let i = 0; i < size * size; i++) {
-        chw[p++] = data[i * 3 + 2]; // B
-        chw[p++] = data[i * 3 + 1]; // G
-        chw[p++] = data[i * 3 + 0]; // R
+      // RGB→BGR & 0〜1正規化
+      for (let i = 0; i < 640 * 640; i++) {
+        float32Data[i] = data[i * 4 + 2] / 255;       // B
+        float32Data[i + 640 * 640] = data[i * 4 + 1] / 255; // G
+        float32Data[i + 2 * 640 * 640] = data[i * 4] / 255; // R
       }
 
-      const tensor = new ort.Tensor('float32', chw, [1, 3, size, size]);
+      return new ort.Tensor("float32", float32Data, [1, 3, 640, 640]);
+    }
 
-      // ==== 推論 ====
-      const results = await session.run({ images: tensor });
-      const output = results.output0.data;
-      const [numClass, numDet] = [84, output.length / 84];
-      console.log(`📦 detections: ${numDet}`);
+    function sigmoid(x) {
+      return 1 / (1 + Math.exp(-x));
+    }
 
-      // ==== 出力処理 ====
+    function postprocess(output, origW, origH) {
       const boxes = [];
-      for (let i = 0; i < numDet; i++) {
-        const start = i * numClass;
-        const cx = output[start + 0];
-        const cy = output[start + 1];
-        const w = output[start + 2];
-        const h = output[start + 3];
-        const confs = output.slice(start + 4);
-        const classId = confs.indexOf(Math.max(...confs));
-        const conf = confs[classId];
+      const data = output[0].data; // [1, 84, anchors]
+      const numAnchors = output[0].dims[2];
 
-        if (conf > 0.25) {
-          boxes.push({ cx, cy, w, h, conf, classId });
+      for (let i = 0; i < numAnchors; i++) {
+        const cx = data[0 * numAnchors + i];
+        const cy = data[1 * numAnchors + i];
+        const w  = data[2 * numAnchors + i];
+        const h  = data[3 * numAnchors + i];
+        const objConf = sigmoid(data[4 * numAnchors + i]);
+
+        // クラス確率
+        let bestClass = 0;
+        let bestScore = 0;
+        for (let c = 0; c < 80; c++) {
+          const clsScore = sigmoid(data[(5 + c) * numAnchors + i]);
+          if (clsScore > bestScore) {
+            bestScore = clsScore;
+            bestClass = c;
+          }
         }
-      }
 
-      // ==== 描画 ====
+        const conf = objConf * bestScore;
+        if (conf < 0.25) continue;
+
+        const x1 = (cx - w / 2) * origW / 640;
+        const y1 = (cy - h / 2) * origH / 640;
+        const x2 = (cx + w / 2) * origW / 640;
+        const y2 = (cy + h / 2) * origH / 640;
+
+        boxes.push({ x1, y1, x2, y2, conf, cls: bestClass });
+      }
+      return boxes;
+    }
+
+    function draw(img, boxes) {
+      ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
       ctx.lineWidth = 2;
       ctx.font = "16px sans-serif";
-      ctx.strokeStyle = "lime";
-      ctx.fillStyle = "lime";
-
       boxes.forEach(b => {
-        const x1 = (b.cx - b.w / 2) * size / size;
-        const y1 = (b.cy - b.h / 2) * size / size;
-        const w = b.w * size / size;
-        const h = b.h * size / size;
-        ctx.strokeRect(x1, y1, w, h);
-        ctx.fillText(`${b.classId} (${b.conf.toFixed(2)})`, x1, y1 - 4);
+        ctx.strokeStyle = "rgba(0, 255, 0, 0.8)";
+        ctx.strokeRect(b.x1, b.y1, b.x2 - b.x1, b.y2 - b.y1);
+        ctx.fillStyle = "rgba(0,255,0,0.3)";
+        ctx.fillRect(b.x1, b.y1 - 20, ctx.measureText("class" + b.cls).width + 50, 20);
+        ctx.fillStyle = "#000";
+        ctx.fillText(`cls${b.cls} ${(b.conf*100).toFixed(1)}%`, b.x1 + 4, b.y1 - 5);
       });
+    }
 
-      console.log("✅ 推論完了:", boxes);
+    document.getElementById("runBtn").onclick = async () => {
+      const file = document.getElementById("fileInput").files[0];
+      if (!file || !session) return;
+      const img = new Image();
+      img.onload = async () => {
+        const tensor = preprocess(img);
+        const feeds = { images: tensor };
+
+        const output = await session.run(feeds);
+        const boxes = postprocess(Object.values(output), img.width, img.height);
+        draw(img, boxes);
+        log(`推論完了: ${boxes.length} 件検出`);
+      };
+      img.src = URL.createObjectURL(file);
     };
+
+    init();
   </script>
 </body>
 </html>
