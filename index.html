@@ -1,136 +1,475 @@
 <!DOCTYPE html>
 <html lang="ja">
 <head>
-  <meta charset="UTF-8">
-  <title>YOLOv8n ONNX Web Demo</title>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>YOLO ONNX Web — Robust Output Parser</title>
   <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.min.js"></script>
   <style>
-    body { font-family: sans-serif; text-align: center; background: #f0f0f0; }
-    canvas { border: 2px solid #333; margin-top: 10px; }
-    #log { margin-top: 10px; white-space: pre; background: #fff; display: inline-block; padding: 10px; text-align: left; }
+    :root { --ctrl-bg: rgba(0,0,0,0.6); --accent: #7CFF6A; --text:#fff;}
+    html,body{height:100%;margin:0;background:#000;color:var(--text);font-family:system-ui,Arial;}
+    #container{position:relative;width:100%;height:100%;overflow:hidden;}
+    video{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;}
+    canvas{position:absolute;inset:0;width:100%;height:100%;pointer-events:none;}
+    #controls{position:fixed;left:50%;bottom:14px;transform:translateX(-50%);background:var(--ctrl-bg);padding:10px 12px;border-radius:10px;z-index:20;display:flex;gap:8px;align-items:center;}
+    input[type="text"]{padding:6px 8px;border-radius:6px;border:1px solid #333;background:#111;color:var(--text);}
+    button{padding:8px 10px;border-radius:8px;border:0;background:var(--accent);color:#000;font-weight:600;cursor:pointer;}
+    #statusBox{position:fixed;left:8px;top:8px;background:var(--ctrl-bg);padding:8px 10px;border-radius:8px;font-size:13px;z-index:20;text-align:left;min-width:240px;}
+    #labelPane{position:fixed;left:10px;bottom:70px;background:rgba(0,0,0,0.45);padding:8px;border-radius:8px;z-index:20;max-width:46vw;font-size:14px;color:#fff;}
+    .small{font-size:12px;color:#ccc;}
   </style>
 </head>
 <body>
-  <h1>YOLOv8n ONNX Web推論デモ</h1>
+  <div id="container">
+    <video id="camera" autoplay playsinline muted></video>
+    <canvas id="viewCanvas"></canvas>
+    <canvas id="inferCanvas" width="640" height="640" style="display:none;"></canvas>
+  </div>
 
-  <input type="file" id="fileInput" accept="image/*"><br>
-  <button id="runBtn">推論実行</button>
-  <br>
-  <canvas id="canvas" width="640" height="640"></canvas>
+  <div id="controls" role="region" aria-label="controls">
+    <input id="idInput" type="text" placeholder="モデルID (例: 1234)" aria-label="model id">
+    <button id="loadBtn">モデル読み込み</button>
+    <label class="small">閾値
+      <input id="thInput" type="number" min="0" max="1" step="0.05" value="0.30" style="width:68px;margin-left:6px;">
+    </label>
+  </div>
 
-  <div id="log"></div>
+  <div id="statusBox">
+    <div>Provider: <strong id="provTxt">—</strong></div>
+    <div id="info" class="small">カメラ準備中...</div>
+    <div id="dbg" class="small" style="margin-top:6px;color:#aaa"></div>
+  </div>
 
-  <script>
-    const modelUrl = "./1234.onnx"; // 同じフォルダに置く
-    let session = null;
-    const canvas = document.getElementById("canvas");
-    const ctx = canvas.getContext("2d");
-    const log = (msg) => { document.getElementById("log").textContent += msg + "\n"; };
+  <div id="labelPane">検出なし</div>
 
-    async function init() {
-      log("モデル読み込み中...");
-      try {
-        session = await ort.InferenceSession.create(modelUrl, {
-          executionProviders: ['wasm'],
-        });
-        log("✅ モデル読み込み完了");
-      } catch (e) {
-        log("❌ モデル読み込み失敗: " + e);
+<script>
+/*
+ Robust YOLO ONNX front-end for browser (GitHub Pages friendly)
+ - auto-detects output layout (channel-major [1,C,N], [1,N,C], flat)
+ - handles cx,cy,w,h  or x1,y1,x2,y2
+ - computes class probs when channels >= 6 (objectness + per-class scores)
+ - applies sigmoid if values look like logits (>1.5)
+ - many console.log for debugging (you asked)
+*/
+
+const video = document.getElementById('camera');
+const viewCanvas = document.getElementById('viewCanvas');
+const viewCtx = viewCanvas.getContext('2d');
+const inferCanvas = document.getElementById('inferCanvas');
+const inferCtx = inferCanvas.getContext('2d');
+
+const idInput = document.getElementById('idInput');
+const loadBtn = document.getElementById('loadBtn');
+const thInput = document.getElementById('thInput');
+const provTxt = document.getElementById('provTxt');
+const info = document.getElementById('info');
+const dbg = document.getElementById('dbg');
+const labelPane = document.getElementById('labelPane');
+
+let session = null;
+let labels = ['object'];
+let providerUsed = null;
+
+const TARGET = 640;
+let scale = 1, nw = 640, nh = 640, dx = 0, dy = 0;
+
+// --- helper: start camera prefer back ---
+async function startCameraPreferBack() {
+  try {
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    const videoInputs = devices.filter(d => d.kind === 'videoinput');
+    const back = videoInputs.find(d => d.label && /(back|rear|environment)/i.test(d.label));
+    let constraints;
+    if (back) constraints = { video: { deviceId: { exact: back.deviceId } } };
+    else constraints = { video: { facingMode: 'environment' } };
+    const stream = await navigator.mediaDevices.getUserMedia(constraints);
+    video.srcObject = stream;
+    await video.play();
+
+    viewCanvas.width = video.videoWidth;
+    viewCanvas.height = video.videoHeight;
+
+    scale = Math.min(TARGET / video.videoWidth, TARGET / video.videoHeight);
+    nw = Math.round(video.videoWidth * scale);
+    nh = Math.round(video.videoHeight * scale);
+    dx = Math.round((TARGET - nw) / 2);
+    dy = Math.round((TARGET - nh) / 2);
+
+    info.textContent = `カメラOK (${video.videoWidth}×${video.videoHeight}) letterbox ${nw}×${nh} dx=${dx},dy=${dy}`;
+    console.log(info.textContent);
+  } catch (err) {
+    console.error('カメラ起動失敗:', err);
+    info.textContent = 'カメラエラー: ' + (err.message || err);
+    throw err;
+  }
+}
+
+// --- preprocess: letterbox -> tensor ---
+function preprocess(toBGR = true, normalize = true) {
+  inferCtx.fillStyle = 'black';
+  inferCtx.fillRect(0,0,TARGET,TARGET);
+  // draw scaled centered
+  inferCtx.drawImage(video, 0, 0, video.videoWidth, video.videoHeight, dx, dy, nw, nh);
+  const img = inferCtx.getImageData(0,0,TARGET,TARGET).data;
+  const wh = TARGET * TARGET;
+  const data = new Float32Array(3 * wh);
+  for (let p = 0, idx = 0; p < wh; p++, idx += 4) {
+    let r = img[idx] / 255.0;
+    let g = img[idx+1] / 255.0;
+    let b = img[idx+2] / 255.0;
+    // If need mean/std, change here
+    if (toBGR) {
+      data[p] = b;
+      data[p + wh] = g;
+      data[p + wh*2] = r;
+    } else {
+      data[p] = r;
+      data[p + wh] = g;
+      data[p + wh*2] = b;
+    }
+  }
+  return new ort.Tensor('float32', data, [1,3,TARGET,TARGET]);
+}
+
+// --- create session (arrayBuffer) with provider fallback ---
+async function loadModelFromURL(url) {
+  try {
+    info.textContent = 'モデルをダウンロード中...';
+    const r = await fetch(url);
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const ab = await r.arrayBuffer();
+    // try webgpu
+    try {
+      provTxt.textContent = '試行: WebGPU';
+      const s = await ort.InferenceSession.create(ab, { executionProviders: ['webgpu'] });
+      providerUsed = 'webgpu';
+      provTxt.textContent = 'WebGPU';
+      console.log('session(provider=webgpu) created');
+      return s;
+    } catch (gerr) {
+      console.warn('WebGPU failed:', gerr);
+      provTxt.textContent = 'WebGPU失敗, WASMへ';
+      const s2 = await ort.InferenceSession.create(ab, { executionProviders: ['wasm'] });
+      providerUsed = 'wasm';
+      provTxt.textContent = 'WASM';
+      console.log('session(provider=wasm) created');
+      return s2;
+    }
+  } catch (err) {
+    console.error('モデル読み込み失敗:', err);
+    throw err;
+  }
+}
+
+// --- parse output robustly (supports multiple layouts) ---
+function parseOutput(outTensor) {
+  // outTensor: ort.Tensor-like object with .data and .dims
+  const data = outTensor.data;
+  const dims = outTensor.dims.slice();
+  console.log('output dims:', dims);
+  dbg.textContent = 'output dims: ' + JSON.stringify(dims);
+
+  // case: dims [1, C, N] channel-major (C small like 6 or 84)
+  if (dims.length === 3 && dims[1] <= 1024 && dims[2] > dims[1]) {
+    const C = dims[1], N = dims[2];
+    console.log(`Detected channel-major shape [1, ${C}, ${N}]`);
+    // channel-major: data[c * N + i] ? Depends on onnxrun; many browsers provide data as contiguous array where channel-major arranged as block of length N per channel.
+    // We'll access value at channel c for anchor i as data[c * N + i]
+    const dets = [];
+    for (let i = 0; i < N; i++) {
+      // read first 5 values
+      if (C >= 6) {
+        // first 4: bbox (cx/cy/w/h or x1/y1/x2/y2 depending on model)
+        const a0 = data[0 * N + i], a1 = data[1 * N + i], a2 = data[2 * N + i], a3 = data[3 * N + i];
+        const scoreRaw = data[4 * N + i];
+        // remaining are class scores if any
+        const classScores = (C > 5) ? Array.from({length: C - 5}, (_,k) => data[(5 + k) * N + i]) : [];
+        dets.push({raw:[a0,a1,a2,a3], scoreRaw, classScores});
+      } else if (C === 5) {
+        const x1 = data[0 * N + i], y1 = data[1 * N + i], x2 = data[2 * N + i], y2 = data[3 * N + i], score = data[4 * N + i];
+        dets.push({raw:[x1,y1,x2,y2], scoreRaw:score, classScores:[]});
+      } else {
+        // fallback - collect first min(C,6)
+        const vals = [];
+        for (let c = 0; c < Math.min(C,6); c++) vals.push(data[c * N + i]);
+        dets.push({raw:vals, scoreRaw: vals[4] ?? 0, classScores:[]});
       }
     }
+    // convert dets into uniform [x1,y1,x2,y2,score,classId]
+    return dets.map(d => decodeDetsFromChannelMajor(d));
+  }
 
-    function preprocess(img) {
-      const tmpCanvas = document.createElement("canvas");
-      tmpCanvas.width = 640;
-      tmpCanvas.height = 640;
-      const tmpCtx = tmpCanvas.getContext("2d");
-      tmpCtx.drawImage(img, 0, 0, 640, 640);
-
-      const imageData = tmpCtx.getImageData(0, 0, 640, 640);
-      const data = imageData.data;
-      const float32Data = new Float32Array(3 * 640 * 640);
-
-      // RGB→BGR & 0〜1正規化
-      for (let i = 0; i < 640 * 640; i++) {
-        float32Data[i] = data[i * 4 + 2] / 255;       // B
-        float32Data[i + 640 * 640] = data[i * 4 + 1] / 255; // G
-        float32Data[i + 2 * 640 * 640] = data[i * 4] / 255; // R
-      }
-
-      return new ort.Tensor("float32", float32Data, [1, 3, 640, 640]);
+  // case: dims [1, N, C] -> sequential per-item groups
+  if (dims.length === 3 && dims[2] <= 1024 && dims[1] > dims[2]) {
+    const N = dims[1], C = dims[2];
+    console.log(`Detected sequential shape [1, ${N}, ${C}]`);
+    const dets = [];
+    for (let i = 0; i < N; i++) {
+      const base = i * C;
+      const arr = [];
+      for (let c = 0; c < C; c++) arr.push(data[base + c]);
+      dets.push(decodeDetsFromArray(arr));
     }
+    return dets;
+  }
 
-    function sigmoid(x) {
-      return 1 / (1 + Math.exp(-x));
+  // fallback: flat groups of 6
+  if (data.length % 6 === 0) {
+    console.log('Detected flat groups of 6');
+    const n = data.length / 6;
+    const dets = [];
+    for (let i = 0; i < n; i++) {
+      const base = i * 6;
+      const arr = [];
+      for (let c = 0; c < 6; c++) arr.push(data[base + c]);
+      dets.push(decodeDetsFromArray(arr));
     }
+    return dets;
+  }
 
-    function postprocess(output, origW, origH) {
-      const boxes = [];
-      const data = output[0].data; // [1, 84, anchors]
-      const numAnchors = output[0].dims[2];
+  console.warn('Unrecognized output layout. dims=', dims, 'len=', data.length);
+  return [];
+}
 
-      for (let i = 0; i < numAnchors; i++) {
-        const cx = data[0 * numAnchors + i];
-        const cy = data[1 * numAnchors + i];
-        const w  = data[2 * numAnchors + i];
-        const h  = data[3 * numAnchors + i];
-        const objConf = sigmoid(data[4 * numAnchors + i]);
+// --- decode helpers ---
+function decodeDetsFromChannelMajor(obj) {
+  // obj.raw: [a0,a1,a2,a3] (could be cx,cy,w,h or x1,y1,x2,y2)
+  // obj.scoreRaw: raw score or objectness, obj.classScores: array
+  let raw = obj.raw;
+  let scoreRaw = obj.scoreRaw;
+  let classScores = obj.classScores || [];
 
-        // クラス確率
-        let bestClass = 0;
-        let bestScore = 0;
-        for (let c = 0; c < 80; c++) {
-          const clsScore = sigmoid(data[(5 + c) * numAnchors + i]);
-          if (clsScore > bestScore) {
-            bestScore = clsScore;
-            bestClass = c;
-          }
+  // decide whether raw are center-based or corners
+  // heuristic: if any raw coord > TARGET*1.5 -> treat as pixel coords; if <=1 treat as normalized
+  const maxRaw = Math.max(...raw.map(Math.abs));
+  let coords;
+  if (raw.length >= 4) {
+    // if values appear like center/size (w,h positive small) or corners (x1<x2)
+    // We'll check pattern: if raw[2] > raw[0] and raw[3] > raw[1] -> maybe x1,y1,x2,y2
+    if (raw[2] > raw[0] && raw[3] > raw[1] && maxRaw > 1.2) {
+      // treat as x1,y1,x2,y2 (pixel or normalized)
+      coords = {type:'xyxy', vals: raw.slice(0,4)};
+    } else {
+      // treat as cx,cy,w,h
+      coords = {type:'cxcywh', vals: raw.slice(0,4)};
+    }
+  } else {
+    coords = {type:'unknown', vals: raw.slice(0,4)};
+  }
+
+  // compute class id and score
+  let classId = 0;
+  let score = scoreRaw;
+  if (classScores && classScores.length > 0) {
+    // if classScores appear to be logits (>1.5), apply sigmoid; else assume probabilities
+    const maxClass = Math.max(...classScores);
+    const maxIdx = classScores.indexOf(maxClass);
+    let classProb = maxClass;
+    if (maxClass > 1.5) classProb = 1 / (1 + Math.exp(-maxClass));
+    // objectness may be logits too
+    if (scoreRaw > 1.5) score = 1 / (1 + Math.exp(-scoreRaw));
+    score = score * classProb;
+    classId = maxIdx;
+  } else {
+    // no class scores; maybe scoreRaw already is final confidence and class unknown -> classId 0
+    if (scoreRaw > 1.5) score = 1 / (1 + Math.exp(-scoreRaw));
+    else score = Math.min(Math.max(scoreRaw, 0), 1);
+    classId = 0;
+  }
+
+  return finalizeBBox(coords, score, classId);
+}
+
+function decodeDetsFromArray(arr) {
+  // arr could be [x1,y1,x2,y2,score,class] OR [cx,cy,w,h,objectness, class_scores...]
+  if (arr.length === 6) {
+    const [a,b,c,d,scoreRaw,classRaw] = arr;
+    // check whether a,b,c,d are center-based or corners:
+    if (c > a && d > b) {
+      // assume x1,y1,x2,y2
+      const x1=a,y1=b,x2=c,y2=d,score = (scoreRaw>1.5)?(1/(1+Math.exp(-scoreRaw))):Math.min(Math.max(scoreRaw,0),1);
+      return [x1,y1,x2,y2,score,Math.floor(classRaw)];
+    } else {
+      // assume cx,cy,w,h
+      let cx=a,cy=b,w=c,h=d;
+      let score = (scoreRaw>1.5)?(1/(1+Math.exp(-scoreRaw))):Math.min(Math.max(scoreRaw,0),1);
+      const x1 = cx - w/2, y1 = cy - h/2, x2 = cx + w/2, y2 = cy + h/2;
+      return [x1,y1,x2,y2,score,Math.floor(classRaw)];
+    }
+  } else if (arr.length > 6) {
+    // assume first 4 are bbox(cx,cy,w,h), 5 is objectness, rest are class scores
+    const cx=arr[0], cy=arr[1], w=arr[2], h=arr[3];
+    let obj = arr[4];
+    const classScores = arr.slice(5);
+    // process logits/probs
+    const maxClassVal = Math.max(...classScores);
+    const maxIdx = classScores.indexOf(maxClassVal);
+    let classProb = maxClassVal;
+    if (maxClassVal > 1.5) classProb = 1/(1+Math.exp(-maxClassVal));
+    if (obj > 1.5) obj = 1/(1+Math.exp(-obj));
+    const conf = obj * classProb;
+    const x1 = cx - w/2, y1 = cy - h/2, x2 = cx + w/2, y2 = cy + h/2;
+    return [x1,y1,x2,y2,conf,maxIdx];
+  } else {
+    // unknown layout -> return zeros
+    return [0,0,0,0,0,0];
+  }
+}
+
+function finalizeBBox(coords, score, classId) {
+  const vals = coords.vals;
+  if (coords.type === 'cxcywh') {
+    const cx = vals[0], cy = vals[1], w = vals[2], h = vals[3];
+    return [cx - w/2, cy - h/2, cx + w/2, cy + h/2, score, Math.floor(classId)];
+  } else if (coords.type === 'xyxy') {
+    return [vals[0], vals[1], vals[2], vals[3], score, Math.floor(classId)];
+  } else {
+    // fallback
+    const v = vals;
+    return [v[0]||0, v[1]||0, v[2]||0, v[3]||0, score, Math.floor(classId)];
+  }
+}
+
+// --- map infer coords (0..TARGET) -> view canvas pixel coords ---
+function inferToView(x, y) {
+  const ox = (x - dx) / scale;
+  const oy = (y - dy) / scale;
+  const cx = Math.max(0, Math.min(viewCanvas.width, ox));
+  const cy = Math.max(0, Math.min(viewCanvas.height, oy));
+  return [cx, cy];
+}
+
+// --- draw detections & left panel ---
+function drawDetections(arr, threshold) {
+  viewCtx.clearRect(0,0,viewCanvas.width, viewCanvas.height);
+  viewCtx.drawImage(video, 0, 0, viewCanvas.width, viewCanvas.height);
+  viewCtx.lineWidth = Math.max(2, Math.round(Math.min(viewCanvas.width, viewCanvas.height)/180));
+  viewCtx.textBaseline = 'top';
+
+  const shown = [];
+  for (const det of arr) {
+    let [x1,y1,x2,y2,score,classId] = det;
+    // apply sigmoid if needed and clip
+    if (score > 1.5) score = 1/(1+Math.exp(-score));
+    score = Math.min(Math.max(score,0),1);
+    if (score < threshold) continue;
+
+    const [vx1, vy1] = inferToView(x1,y1);
+    const [vx2, vy2] = inferToView(x2,y2);
+    const vw = vx2 - vx1, vh = vy2 - vy1;
+
+    viewCtx.strokeStyle = 'lime';
+    viewCtx.beginPath();
+    viewCtx.rect(vx1, vy1, vw, vh);
+    viewCtx.stroke();
+
+    // label
+    const labelText = `${labels[Math.floor(classId)] || classId} ${Math.round(score*100)}%`;
+    viewCtx.font = `${Math.max(12, Math.round(viewCanvas.height / 36))}px sans-serif`;
+    const tw = viewCtx.measureText(labelText).width;
+    const th = Math.max(16, Math.round(viewCanvas.height / 40));
+    const lx = Math.max(4, vx1);
+    const ly = Math.min(viewCanvas.height - th - 6, vy1 + vh - th - 6);
+
+    viewCtx.fillStyle = 'rgba(0,255,0,0.6)';
+    viewCtx.fillRect(lx - 2, ly - 2, tw + 8, th + 6);
+    viewCtx.fillStyle = '#000';
+    viewCtx.fillText(labelText, lx + 2, ly + 2);
+
+    shown.push(labelText);
+    console.log('Draw:', labelText, 'bbox infer->view:', [x1,y1,x2,y2], '->', [vx1,vy1,vx2,vy2]);
+  }
+
+  labelPane.innerHTML = '';
+  if (shown.length === 0) labelPane.textContent = '検出なし';
+  else {
+    for (let i=0;i<Math.min(8, shown.length); i++) {
+      const d = document.createElement('div');
+      d.textContent = shown[i];
+      labelPane.appendChild(d);
+    }
+  }
+}
+
+// --- main inference loop (non-blocking) ---
+let busy = false;
+async function inferenceTick() {
+  if (!session) return;
+  if (!video.videoWidth) {
+    requestAnimationFrame(inferenceTick);
+    return;
+  }
+  if (busy) {
+    requestAnimationFrame(inferenceTick);
+    return;
+  }
+  busy = true;
+  try {
+    const tensor = preprocess(true, true); // BGR=true, normalize=true
+    // find input name
+    const inputName = (session.inputNames && session.inputNames.length > 0) ? session.inputNames[0] : Object.keys(session.inputMetadata || {})[0];
+    const outputMap = await session.run({ [inputName]: tensor });
+    const outKey = Object.keys(outputMap)[0];
+    const outTensor = outputMap[outKey];
+    console.log('outTensor.dims=', outTensor.dims);
+    console.log('sample out data[0..20]=', Array.from(outTensor.data.slice(0, Math.min(20, outTensor.data.length))));
+    const detections = parseOutput(outTensor); // returns array of [x1,y1,x2,y2,score,class]
+    drawDetections(detections, parseFloat(thInput.value) || 0.3);
+    dbg.textContent = `candidates: ${detections.length}`;
+  } catch (err) {
+    console.error('推論エラー:', err);
+    info.textContent = '推論エラー: ' + (err.message || err);
+  } finally {
+    busy = false;
+    requestAnimationFrame(inferenceTick);
+  }
+}
+
+// --- load handler ---
+loadBtn.addEventListener('click', async () => {
+  const id = idInput.value.trim();
+  if (!id) return alert('モデルIDを入力して下さい（例:1234）');
+  const modelUrl = `./${id}.onnx`;
+  const jsonUrl = `./${id}-k.json`;
+  try {
+    info.textContent = 'モデル読み込み中...';
+    session = await loadModelFromURL(modelUrl);
+    // load labels
+    try {
+      const r = await fetch(jsonUrl);
+      if (r.ok) {
+        const j = await r.json();
+        if (Array.isArray(j)) labels = j;
+        else if (typeof j === 'object') {
+          const arr = [];
+          for (const k of Object.keys(j)) arr[parseInt(k)] = j[k];
+          labels = arr;
         }
-
-        const conf = objConf * bestScore;
-        if (conf < 0.25) continue;
-
-        const x1 = (cx - w / 2) * origW / 640;
-        const y1 = (cy - h / 2) * origH / 640;
-        const x2 = (cx + w / 2) * origW / 640;
-        const y2 = (cy + h / 2) * origH / 640;
-
-        boxes.push({ x1, y1, x2, y2, conf, cls: bestClass });
       }
-      return boxes;
+    } catch (e) {
+      console.warn('labels load failed', e);
     }
+    info.textContent = `モデル読み込み完了 (${providerUsed})`;
+    provTxt.textContent = providerUsed;
+    // start inference loop
+    requestAnimationFrame(inferenceTick);
+  } catch (err) {
+    console.error('model load failed', err);
+    info.textContent = 'モデル読み込み失敗: ' + (err.message || err);
+    provTxt.textContent = '—';
+  }
+});
 
-    function draw(img, boxes) {
-      ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-      ctx.lineWidth = 2;
-      ctx.font = "16px sans-serif";
-      boxes.forEach(b => {
-        ctx.strokeStyle = "rgba(0, 255, 0, 0.8)";
-        ctx.strokeRect(b.x1, b.y1, b.x2 - b.x1, b.y2 - b.y1);
-        ctx.fillStyle = "rgba(0,255,0,0.3)";
-        ctx.fillRect(b.x1, b.y1 - 20, ctx.measureText("class" + b.cls).width + 50, 20);
-        ctx.fillStyle = "#000";
-        ctx.fillText(`cls${b.cls} ${(b.conf*100).toFixed(1)}%`, b.x1 + 4, b.y1 - 5);
-      });
-    }
-
-    document.getElementById("runBtn").onclick = async () => {
-      const file = document.getElementById("fileInput").files[0];
-      if (!file || !session) return;
-      const img = new Image();
-      img.onload = async () => {
-        const tensor = preprocess(img);
-        const feeds = { images: tensor };
-
-        const output = await session.run(feeds);
-        const boxes = postprocess(Object.values(output), img.width, img.height);
-        draw(img, boxes);
-        log(`推論完了: ${boxes.length} 件検出`);
-      };
-      img.src = URL.createObjectURL(file);
-    };
-
-    init();
-  </script>
+// --- init camera on load ---
+(async () => {
+  try {
+    await startCameraPreferBack();
+    provTxt.textContent = '未選択';
+    info.textContent = 'カメラ準備完了。モデルIDを入力して読み込んでください。';
+  } catch (err) {
+    // already reported
+  }
+})();
+</script>
 </body>
 </html>
