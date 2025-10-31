@@ -1,432 +1,107 @@
 <!DOCTYPE html>
 <html lang="ja">
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>YOLO ONNX Web Demo (GitHub Pages Ready)</title>
-  <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@latest/dist/ort.min.js"></script>
+  <meta charset="UTF-8">
+  <title>YOLOv8 ONNX Web推論</title>
+  <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.min.js"></script>
   <style>
-    :root { --ctrl-bg: rgba(0,0,0,0.6); --accent: #7CFF6A; --text:#fff; }
-    html,body{height:100%;margin:0;background:#000;color:var(--text);font-family:system-ui,Arial;}
-    #container{position:relative;width:100%;height:100%;overflow:hidden;background:#000;}
-    video{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;}
-    canvas{position:absolute;inset:0;width:100%;height:100%;pointer-events:none;}
-    #controls{position:fixed;left:50%;bottom:14px;transform:translateX(-50%);background:var(--ctrl-bg);padding:10px 12px;border-radius:10px;z-index:20;display:flex;gap:8px;align-items:center;}
-    input[type="text"]{padding:6px 8px;border-radius:6px;border:1px solid #333;background:#111;color:var(--text);}
-    button{padding:8px 10px;border-radius:8px;border:0;background:var(--accent);color:#000;font-weight:600;cursor:pointer;}
-    #statusBox{position:fixed;left:8px;top:8px;background:var(--ctrl-bg);padding:8px 10px;border-radius:8px;font-size:13px;z-index:20;text-align:left;min-width:220px;}
-    #labelPane{position:fixed;left:10px;bottom:70px;background:rgba(0,0,0,0.45);padding:8px;border-radius:8px;z-index:20;max-width:46vw;font-size:14px;color:#fff;}
-    .small{font-size:12px;color:#ccc;}
+    body { font-family: sans-serif; text-align: center; background: #f4f4f4; }
+    canvas { border: 1px solid #333; margin-top: 10px; }
+    input { margin: 10px; }
   </style>
 </head>
 <body>
-  <div id="container">
-    <video id="camera" autoplay playsinline muted></video>
-    <canvas id="viewCanvas"></canvas>
-    <!-- 推論用キャンバス（非表示） -->
-    <canvas id="inferCanvas" width="640" height="640" style="display:none;"></canvas>
-  </div>
+  <h2>YOLOv8 ONNX 推論デモ</h2>
+  <input type="file" id="fileInput" accept="image/*"><br>
+  <canvas id="canvas"></canvas>
 
-  <div id="controls" role="region" aria-label="controls">
-    <input id="idInput" type="text" placeholder="モデルID (例: 1234)" aria-label="model id">
-    <button id="loadBtn">モデル読み込み</button>
-    <label class="small">閾値
-      <input id="thInput" type="number" min="0" max="1" step="0.05" value="0.30" style="width:68px;margin-left:6px;">
-    </label>
-  </div>
+  <script type="module">
+    const modelPath = "./yolov8n.onnx"; // GitHub Pages直下に配置
 
-  <div id="statusBox">
-    <div>Provider: <strong id="provTxt">—</strong></div>
-    <div id="info" class="small">カメラ準備中...</div>
-  </div>
+    const session = await ort.InferenceSession.create(modelPath, {
+      executionProviders: ['wasm'],
+    });
+    console.log("✅ モデル読み込み成功:", modelPath);
 
-  <div id="labelPane">検出なし</div>
+    const fileInput = document.getElementById("fileInput");
+    const canvas = document.getElementById("canvas");
+    const ctx = canvas.getContext("2d");
 
-<script>
-/*
-  完全版 index.html
-  - Letterbox (long side -> 640) preprocessing
-  - RGB->BGR toggle, normalization (/255) built-in
-  - WebGPU attempt -> WASM fallback (auto), provider shown
-  - Prefer back camera (if available), fallback to environment/default
-  - Robust parsing of ONNX output formats:
-      supports [1,N,6] (N x 6), [1,6,N], flat groups of 6, and handles separate class scores if present
-  - Mapping inference coords (infer canvas 640x640) back to original camera pixels for drawing
-  - Designed to be placed on GitHub Pages: keep model as ./<id>.onnx and ./<id>-k.json
-*/
+    fileInput.onchange = async () => {
+      const file = fileInput.files[0];
+      const img = new Image();
+      img.src = URL.createObjectURL(file);
+      await img.decode();
 
-const video = document.getElementById('camera');
-const viewCanvas = document.getElementById('viewCanvas');
-const viewCtx = viewCanvas.getContext('2d');
-const inferCanvas = document.getElementById('inferCanvas');
-const inferCtx = inferCanvas.getContext('2d');
+      const size = 640; // YOLOv8標準サイズ
+      canvas.width = size;
+      canvas.height = size;
 
-const idInput = document.getElementById('idInput');
-const loadBtn = document.getElementById('loadBtn');
-const thInput = document.getElementById('thInput');
-const provTxt = document.getElementById('provTxt');
-const info = document.getElementById('info');
-const labelPane = document.getElementById('labelPane');
+      // ==== レターボックス付き描画 ====
+      const scale = Math.min(size / img.width, size / img.height);
+      const x = (size - img.width * scale) / 2;
+      const y = (size - img.height * scale) / 2;
+      ctx.fillStyle = "black";
+      ctx.fillRect(0, 0, size, size);
+      ctx.drawImage(img, x, y, img.width * scale, img.height * scale);
 
-let session = null;
-let labels = ['object'];
-let providerUsed = null;
+      // ==== テンソル作成 ====
+      const imageData = ctx.getImageData(0, 0, size, size);
+      const data = Float32Array.from(imageData.data)
+        .filter((_, i) => i % 4 !== 3) // alpha除去
+        .map(v => v / 255.0); // 標準化
 
-// letterbox params (computed after camera start)
-let target = 640;
-let scale = 1;
-let nw = 640, nh = 640, dx = 0, dy = 0; // infer canvas draw params
-let busy = false; // avoid overlapping inference
-
-// --- camera: prefer back/rear camera ---
-async function startCameraPreferBack() {
-  try {
-    const devices = await navigator.mediaDevices.enumerateDevices();
-    const videoInputs = devices.filter(d => d.kind === 'videoinput');
-    let constraints;
-    // try to find label containing back/rear/environment
-    const back = videoInputs.find(d => d.label && /(back|rear|environment)/i.test(d.label));
-    if (back) {
-      constraints = { video: { deviceId: { exact: back.deviceId } } };
-    } else {
-      constraints = { video: { facingMode: 'environment' } };
-    }
-    const stream = await navigator.mediaDevices.getUserMedia(constraints);
-    video.srcObject = stream;
-    await video.play();
-
-    // set view canvas to real resolution
-    viewCanvas.width = video.videoWidth;
-    viewCanvas.height = video.videoHeight;
-
-    // compute letterbox params for infer canvas
-    scale = Math.min(target / video.videoWidth, target / video.videoHeight);
-    nw = Math.round(video.videoWidth * scale);
-    nh = Math.round(video.videoHeight * scale);
-    dx = Math.round((target - nw) / 2);
-    dy = Math.round((target - nh) / 2);
-
-    info.textContent = `カメラ準備 OK (${video.videoWidth}×${video.videoHeight}), letterbox ${nw}×${nh}`;
-  } catch (err) {
-    console.error('カメラ起動失敗:', err);
-    info.textContent = 'カメラエラー: ' + (err.message || err);
-    throw err;
-  }
-}
-
-// --- preprocessing: draw video into inferCanvas with letterbox, create tensor ---
-// options: toBGR (default true), normalize true (/255) and optional mean/std application
-function preprocessToTensor(toBGR = true, normalize = true) {
-  // draw black background then scaled video centered
-  inferCtx.fillStyle = 'black';
-  inferCtx.fillRect(0,0,target,target);
-  inferCtx.drawImage(video, 0, 0, video.videoWidth, video.videoHeight, dx, dy, nw, nh);
-
-  const img = inferCtx.getImageData(0,0,target,target).data;
-  const wh = target * target;
-  const tensorData = new Float32Array(3 * wh);
-
-  // optional mean/std arrays if needed by model:
-  // const mean = [0.0, 0.0, 0.0];
-  // const std = [1.0, 1.0, 1.0];
-
-  for (let y = 0, p = 0; y < target; y++) {
-    for (let x = 0; x < target; x++, p++) {
-      const i = (p * 4);
-      let r = img[i] / 255.0;
-      let g = img[i+1] / 255.0;
-      let b = img[i+2] / 255.0;
-
-      // If normalization with mean/std required, apply here:
-      // r = (r - mean[0]) / std[0];
-      // g = (g - mean[1]) / std[1];
-      // b = (b - mean[2]) / std[2];
-
-      if (toBGR) {
-        tensorData[p] = b;
-        tensorData[p + wh] = g;
-        tensorData[p + wh*2] = r;
-      } else {
-        tensorData[p] = r;
-        tensorData[p + wh] = g;
-        tensorData[p + wh*2] = b;
+      // RGB → BGR
+      const chw = new Float32Array(3 * size * size);
+      let p = 0;
+      for (let i = 0; i < size * size; i++) {
+        chw[p++] = data[i * 3 + 2]; // B
+        chw[p++] = data[i * 3 + 1]; // G
+        chw[p++] = data[i * 3 + 0]; // R
       }
-    }
-  }
-  return new ort.Tensor('float32', tensorData, [1, 3, target, target]);
-}
 
-// --- provider creation with fallback: webgpu -> wasm ---
-async function createSessionWithFallback(modelPath) {
-  // try WebGPU first
-  provTxt.textContent = '試行: WebGPU...';
-  try {
-    const s = await ort.InferenceSession.create(modelPath, { executionProviders: ['webgpu'] });
-    providerUsed = 'webgpu';
-    provTxt.textContent = 'WebGPU';
-    console.log('session created with WebGPU');
-    return s;
-  } catch (gpuErr) {
-    console.warn('WebGPU failed, trying WASM:', gpuErr);
-    provTxt.textContent = 'WebGPU失敗, WASMを試行';
-    try {
-      const s2 = await ort.InferenceSession.create(modelPath, { executionProviders: ['wasm'] });
-      providerUsed = 'wasm';
-      provTxt.textContent = 'WASM';
-      console.log('session created with WASM');
-      return s2;
-    } catch (wasmErr) {
-      console.error('WASM failed too:', wasmErr);
-      provTxt.textContent = 'モデル読み込み失敗';
-      throw wasmErr;
-    }
-  }
-}
+      const tensor = new ort.Tensor('float32', chw, [1, 3, size, size]);
 
-// --- parse ONNX output robustly ---
-// supports data arranged as:
-//  - shape [1, N, 6]  -> groups of 6 sequential
-//  - shape [1, 6, N]  -> channel-major (6 channels of length N) -> we convert to per-box
-//  - flat array grouped by 6 -> fallback
-// returns array of detections: [[x1,y1,x2,y2,score,classId], ...] in infer-canvas coords (0..target)
-function parseOutputTensor(outTensor) {
-  const data = outTensor.data;
-  const dims = outTensor.dims.slice(); // copy
-  // normalize dims like [1,N,6] or [1,6,N]
-  let dets = [];
-  if (dims.length === 3) {
-    if (dims[1] === 6) {
-      // shape [1,6,N] -> channel-major
-      const channels = dims[1];
-      const n = dims[2];
-      for (let i = 0; i < n; i++) {
-        const x1 = data[i + 0 * n];
-        const y1 = data[i + 1 * n];
-        const x2 = data[i + 2 * n];
-        const y2 = data[i + 3 * n];
-        const score = data[i + 4 * n];
-        const classId = data[i + 5 * n];
-        dets.push([x1, y1, x2, y2, score, classId]);
-      }
-      return dets;
-    } else if (dims[2] === 6) {
-      // shape [1,N,6] -> sequential groups of 6
-      const n = dims[1];
-      for (let i = 0; i < n; i++) {
-        const base = i * 6;
-        const x1 = data[base + 0];
-        const y1 = data[base + 1];
-        const x2 = data[base + 2];
-        const y2 = data[base + 3];
-        const score = data[base + 4];
-        const classId = data[base + 5];
-        dets.push([x1, y1, x2, y2, score, classId]);
-      }
-      return dets;
-    }
-  }
+      // ==== 推論 ====
+      const results = await session.run({ images: tensor });
+      const output = results.output0.data;
+      const [numClass, numDet] = [84, output.length / 84];
+      console.log(`📦 detections: ${numDet}`);
 
-  // fallback: assume flat groups of 6
-  if (data.length % 6 === 0) {
-    const n = data.length / 6;
-    for (let i = 0; i < n; i++) {
-      const base = i * 6;
-      const x1 = data[base + 0];
-      const y1 = data[base + 1];
-      const x2 = data[base + 2];
-      const y2 = data[base + 3];
-      const score = data[base + 4];
-      const classId = data[base + 5];
-      dets.push([x1, y1, x2, y2, score, classId]);
-    }
-    return dets;
-  }
+      // ==== 出力処理 ====
+      const boxes = [];
+      for (let i = 0; i < numDet; i++) {
+        const start = i * numClass;
+        const cx = output[start + 0];
+        const cy = output[start + 1];
+        const w = output[start + 2];
+        const h = output[start + 3];
+        const confs = output.slice(start + 4);
+        const classId = confs.indexOf(Math.max(...confs));
+        const conf = confs[classId];
 
-  // if nothing matched, return empty
-  console.warn('出力形式が想定外です。dims=', dims, 'len=', data.length);
-  return [];
-}
-
-// --- map infer coords (0..target) -> original video pixels ---
-// returns [x,y] in original video pixel coordinates (viewCanvas coords)
-function inferToView(x, y) {
-  // remove letterbox offset (dx,dy) then divide by scale to original pixel coordinates
-  const ox = (x - dx) / scale;
-  const oy = (y - dy) / scale;
-  // clamp to canvas
-  const cx = Math.max(0, Math.min(viewCanvas.width, ox));
-  const cy = Math.max(0, Math.min(viewCanvas.height, oy));
-  return [cx, cy];
-}
-
-// --- draw detections on viewCanvas and update left panel ---
-function drawDetections(detections, threshold) {
-  // draw current frame first
-  viewCtx.clearRect(0,0,viewCanvas.width,viewCanvas.height);
-  viewCtx.drawImage(video, 0, 0, viewCanvas.width, viewCanvas.height);
-
-  const shown = [];
-
-  // line width relative to image size
-  viewCtx.lineWidth = Math.max(2, Math.round(Math.min(viewCanvas.width, viewCanvas.height) / 160));
-  viewCtx.textBaseline = 'top';
-
-  for (const det of detections) {
-    let [x1, y1, x2, y2, score, classId] = det;
-
-    // sometimes "score" might be raw logits; if >1 commonly it's not probability
-    // we try to detect numeric range: if score > 1.5, apply sigmoid to compress; otherwise assume it's probability
-    if (score > 1.5) {
-      score = 1 / (1 + Math.exp(-score));
-    }
-    // clip into 0..1
-    score = Math.min(Math.max(score, 0), 1);
-
-    if (score < threshold) continue;
-
-    // map corners from infer canvas -> original view canvas coords
-    const [vx1, vy1] = inferToView(x1, y1);
-    const [vx2, vy2] = inferToView(x2, y2);
-    const vw = vx2 - vx1;
-    const vh = vy2 - vy1;
-
-    // rect
-    viewCtx.strokeStyle = 'lime';
-    viewCtx.beginPath();
-    viewCtx.rect(vx1, vy1, vw, vh);
-    viewCtx.stroke();
-
-    // label background and text (bottom-left inside bbox)
-    const labelText = `${labels[Math.floor(classId)] || classId} ${Math.round(score * 100)}%`;
-    viewCtx.font = `${Math.max(12, Math.round(viewCanvas.height / 36))}px sans-serif`;
-    const tw = viewCtx.measureText(labelText).width;
-    const th = Math.max(16, Math.round(viewCanvas.height / 40));
-    const lx = Math.max(4, vx1);
-    const ly = Math.min(viewCanvas.height - th - 4, vy1 + vh - th - 4);
-
-    viewCtx.fillStyle = 'rgba(0,255,0,0.6)';
-    viewCtx.fillRect(lx - 2, ly - 2, tw + 8, th + 6);
-    viewCtx.fillStyle = '#000';
-    viewCtx.fillText(labelText, lx + 2, ly + 2);
-
-    shown.push(labelText);
-  }
-
-  // update left panel (show up to 8)
-  labelPane.innerHTML = '';
-  if (shown.length === 0) {
-    labelPane.textContent = '検出なし';
-  } else {
-    for (let i = 0; i < Math.min(8, shown.length); i++) {
-      const d = document.createElement('div');
-      d.textContent = shown[i];
-      labelPane.appendChild(d);
-    }
-  }
-}
-
-// --- main loop: do inference when not busy; schedule via requestAnimationFrame ---
-async function runInferenceLoop() {
-  if (!session) return;
-  try {
-    if (!busy) {
-      busy = true;
-      // preprocess
-      const tensor = preprocessToTensor(true, true); // BGR=true, normalize=true
-      // choose input name dynamically
-      const inputName = (session.inputNames && session.inputNames.length > 0) ? session.inputNames[0] : Object.keys(session.inputMetadata || {})[0];
-      const outputMap = await session.run({ [inputName]: tensor });
-
-      // find primary output tensor (first)
-      const outKey = Object.keys(outputMap)[0];
-      const outTensor = outputMap[outKey];
-      const detections = parseOutputTensor(outTensor);
-
-      const threshold = parseFloat(thInput.value) || 0.3;
-      drawDetections(detections, threshold);
-
-      busy = false;
-    }
-  } catch (err) {
-    console.error('推論エラー:', err);
-    info.textContent = '推論エラー: ' + (err && err.message ? err.message : err);
-    busy = false;
-  } finally {
-    requestAnimationFrame(runInferenceLoop);
-  }
-}
-
-// --- load model button handler ---
-loadBtn.addEventListener('click', async () => {
-  const id = idInput.value.trim();
-  if (!id) return alert('モデルIDを入力してください (例: 1234)');
-
-  const modelPath = `./${id}.onnx`;
-  const jsonPath = `./${id}-k.json`;
-
-  try {
-    info.textContent = 'モデル読み込み中...';
-    session = await createSessionWithFallback(modelPath);
-
-    // load labels if present (supports array or { "0": "label" } )
-    try {
-      const r = await fetch(jsonPath);
-      if (r.ok) {
-        const j = await r.json();
-        if (Array.isArray(j)) labels = j;
-        else if (typeof j === 'object') {
-          const arr = [];
-          for (const k of Object.keys(j)) arr[parseInt(k)] = j[k];
-          labels = arr;
+        if (conf > 0.25) {
+          boxes.push({ cx, cy, w, h, conf, classId });
         }
       }
-    } catch (e) {
-      console.warn('labels load failed:', e);
-    }
 
-    info.textContent = `モデル読み込み完了 (${providerUsed})`;
-    provTxt.textContent = providerUsed || provTxt.textContent;
+      // ==== 描画 ====
+      ctx.lineWidth = 2;
+      ctx.font = "16px sans-serif";
+      ctx.strokeStyle = "lime";
+      ctx.fillStyle = "lime";
 
-    // start inference loop
-    requestAnimationFrame(runInferenceLoop);
-  } catch (err) {
-    console.error('モデル読み込み失敗:', err);
-    info.textContent = 'モデル読み込み失敗: ' + (err && err.message ? err.message : err);
-    session = null;
-    provTxt.textContent = '—';
-  }
-});
+      boxes.forEach(b => {
+        const x1 = (b.cx - b.w / 2) * size / size;
+        const y1 = (b.cy - b.h / 2) * size / size;
+        const w = b.w * size / size;
+        const h = b.h * size / size;
+        ctx.strokeRect(x1, y1, w, h);
+        ctx.fillText(`${b.classId} (${b.conf.toFixed(2)})`, x1, y1 - 4);
+      });
 
-// --- create session with fallback (used by load handler) ---
-async function createSessionWithFallback(modelPath) {
-  // try webgpu first
-  provTxt.textContent = '試行: WebGPU...';
-  try {
-    const s = await ort.InferenceSession.create(modelPath, { executionProviders: ['webgpu'] });
-    providerUsed = 'webgpu';
-    provTxt.textContent = 'WebGPU';
-    return s;
-  } catch (gpuErr) {
-    console.warn('WebGPU failed:', gpuErr);
-    provTxt.textContent = 'WebGPU失敗, WASMを試行';
-    // try wasm
-    const s2 = await ort.InferenceSession.create(modelPath, { executionProviders: ['wasm'] });
-    providerUsed = 'wasm';
-    provTxt.textContent = 'WASM';
-    return s2;
-  }
-}
-
-// --- initialize camera on page load ---
-(async () => {
-  try {
-    await startCameraPreferBack();
-    provTxt.textContent = '未選択';
-    info.textContent = 'カメラ準備完了。モデルIDを入力して読み込んでください。';
-  } catch (err) {
-    // already handled in startCameraPreferBack
-  }
-})();
-</script>
+      console.log("✅ 推論完了:", boxes);
+    };
+  </script>
 </body>
 </html>
